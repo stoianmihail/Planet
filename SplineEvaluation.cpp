@@ -34,8 +34,8 @@ const double MIN_ANGLE = 1e-16; // 10 ^ (-precisionOfDouble)
 const double MAX_RUNS = 2;
 //---------------------------------------------------------------------------
 double globalDiff;
-double powers[2];
-std::vector<segCoord> globalSpline;
+double powers[2]; // for sse or avx
+std::vector<segCoord> globalSpline; // we need it to define the function for the Remez algorithm
 static double interpolate(const vector<Coord>& spline, double pos);
 static std::vector<Coord> preciseApproximation(const std::vector<Coord>& function, unsigned desiredSize);
 static pair<double, double> computeOverallPrecision(const std::vector<Coord>& func, const std::vector<Coord>& reduced);
@@ -588,6 +588,8 @@ unsigned SplineEvaluation::searchLeft(int index, double& x) const
     // Don't forget that we padded the array, so use "offset" a the lowest index of the array
     return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);
 #elif 1
+    // We've already padded the left part with values lower than the first element of the array
+    // In this way we don't have any overflows
     int pow = 1;
     while (this->values[index - pow] > x)
         pow *= 2;
@@ -670,6 +672,8 @@ unsigned SplineEvaluation::searchRight(int index, double& x) const
     // Don't forget that we padded the array.
     return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1 + this->offset), x);
 #elif 1
+    // We've already padded the right part with values greater than the last element of the array
+    // In this way we don't have any overflows
     int pow = 1;
     while (this->values[index + pow] < x)
         pow <<= 1;
