@@ -20,7 +20,6 @@
 #include <immintrin.h>
 
 using namespace std;
-
 //---------------------------------------------------------------------------
 typedef std::pair<double,double> Coord;
 typedef std::pair<double, unsigned> segCoord;
@@ -35,6 +34,7 @@ const double MIN_ANGLE = 1e-16; // 10 ^ (-precisionOfDouble)
 const double MAX_RUNS = 2;
 //---------------------------------------------------------------------------
 double globalDiff;
+double powers[2];
 std::vector<segCoord> globalSpline;
 static double interpolate(const vector<Coord>& spline, double pos);
 static std::vector<Coord> preciseApproximation(const std::vector<Coord>& function, unsigned desiredSize);
@@ -587,11 +587,45 @@ unsigned SplineEvaluation::searchLeft(int index, double& x) const
     // Continue with binary search, based on the last power
     // Don't forget that we padded the array, so use "offset" a the lowest index of the array
     return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);
-#else
+#elif 1
     int pow = 1;
     while (this->values[index - pow] > x)
         pow *= 2;
-    return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);    
+    return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);
+#else
+    // We've already padded the left part with values lower than the first element of the array
+    // In this way we don't have any overflows
+    // Make a fast check for the first 2 values
+    if (this->values[index - 1] < x)
+        return index - 1;
+    if (this->values[index - 2] < x)
+        return index - 2;
+    
+    int pow = 4;
+    // Load x in an ymm register
+    __m128d constant = _mm_set1_pd(x);
+    leftSseExpSearch : {
+        // Load the next steps
+        powers[0] = this->values[index - pow];
+        powers[1] = this->values[index - (pow << 1)];
+        __m128d xmm = _mm_loadu_pd(powers);
+        
+        // Compare x with the further steps
+        xmm = _mm_cmplt_pd(constant, xmm);
+        // Get the result of the comparison
+        int ret = _mm_movemask_pd(xmm);
+        
+        // If x is still lower than all steps, continue searching
+        if (ret == 0x3) {
+            pow <<= 2;
+            goto leftSseExpSearch;
+        }
+        // The last used power is shifted with the count of steps which are greater than x (the number of set bits in ret)
+        pow <<= ret;
+    }
+    // Continue with binary search, based on the last power
+    // Don't forget that we padded the array, so use "offset" a the lowest index of the array
+    return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);
 #endif    
 }
 //---------------------------------------------------------------------------
@@ -635,12 +669,46 @@ unsigned SplineEvaluation::searchRight(int index, double& x) const
     // Continue with binary search, based on the last power
     // Don't forget that we padded the array.
     return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1 + this->offset), x);
-#else
+#elif 1
     int pow = 1;
     while (this->values[index + pow] < x)
         pow <<= 1;
     return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1 + this->offset), x);
-#endif    
+#else
+    // We've already padded the right part with values greater than the last element of the array
+    // In this way we don't have any overflows
+    // Make a fast check for the first 2 values
+    if (this->values[index + 1] > x)
+        return index;
+    if (this->values[index + 2] > x)
+        return index + 1;
+
+    int pow = 4;
+    // Load x in an ymm register
+    __m128d constant = _mm_set1_pd(x);
+    rightSseExpSearch : {
+        // Load the next steps
+        powers[0] = this->values[index + pow];
+        powers[1] = this->values[index + (pow << 1)];
+
+        // Compare x with the further steps
+        __m128d xmm = _mm_loadu_pd(powers);
+        xmm = _mm_cmpgt_pd(constant, xmm);
+        // Get the result of the comparison
+        int ret = _mm_movemask_pd(xmm);
+        
+        // If x is still greater than all steps, continue searching
+        if (ret == 0x3) {
+            pow <<= 2;
+            goto rightSseExpSearch;
+        }
+        // The last used power is shifted with the count of steps which are lower than x (the number of set bits in ret)
+        pow <<= ret;
+    }
+    // Continue with binary search, based on the last power
+    // Don't forget that we padded the array.
+    return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1 + this->offset), x);
+#endif
 }
 //---------------------------------------------------------------------------
 static unsigned filterSegment(unsigned countOfSegments, double& segment) 
@@ -694,6 +762,11 @@ double SplineEvaluation::selfInterpolate(unsigned segment, double& x) const
 double SplineEvaluation::chebyshevEvaluate(double& x) const 
 // evaluates f(x), after having fitted a polynomial to the spline
 {
+    // Check the boundaries
+    if (x <= spline.front().first)
+        return spline.front().second;
+    if (x >= spline.back().first)
+        return spline.back().second;
     return selfInterpolate(findExactSegment(hornerEvaluate(x), x), x);
 }
 //---------------------------------------------------------------------------
@@ -958,6 +1031,7 @@ int main(int argc,char* argv[])
             unsigned alright = 0;
             for (unsigned index = 0; index < cdf.size(); ++index) {
                 Coord elem = cdf[testIndexes[index]];
+                elem.first += 0.005;
                 //cerr << setprecision(12) << "real segment of (" << elem.first << ", " << elem.second << ") is " << realSegment(reduced.spline, elem.first) << endl;  
                 double y = reduced.chebyshevEvaluate(elem.first); //reduced.hornerEvaluate(elem.first);
                 curr = max(curr, fabs(y - elem.second));

@@ -11,7 +11,7 @@ class SplineEvaluation;
 class SplineEvaluation 
 {
     private:
-    unsigned limitSplineSize = 1000;
+    unsigned limitSplineSize = 100000;
     int32_t offset;
     int32_t length;
     
