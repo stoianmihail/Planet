@@ -951,6 +951,11 @@ int main(int argc,char* argv[])
     unsigned modeOfSearch = atoi(argv[5]);
     unsigned testMode = atoi(argv[6]);
     
+    if (size > cdf.size()) {
+        cerr << "Spline will contain more points than the function itself!" << endl;
+        exit(0);
+    }
+    
     // Construct the spline and also fit the polynomial if modeSearch allows for that
     SplineEvaluation reduced(cdf, size, useOfSpline, modeOfSearch, testMode);
 
