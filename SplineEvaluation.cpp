@@ -1004,7 +1004,7 @@ int main(int argc,char* argv[])
             if (alright == cdf.size())
                 cerr << "parfum!!!" << endl;
             else 
-                cerr << "mai dai o tura!!!" << endl;
+                cerr << "try again!!!Sth went wrong!!" << endl;
             cerr << setprecision(12) << "check: " << curr / cdf.size() << endl;
         } else {
             cerr << "Start testing without spline!" << endl;
@@ -1032,9 +1032,9 @@ int main(int argc,char* argv[])
 #endif
             }
             if (alright == cdf.size())
-                cerr << "parfum!!!" << endl;
+                cerr << "parfume!!!" << endl;
             else 
-                cerr << "mai dai o tura!!!" << endl;
+                cerr << "try again!!! Something went wrong!" << endl;
             cerr << setprecision(12) << "check: " << curr / cdf.size() << endl;
         }
     } else {

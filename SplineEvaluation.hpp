@@ -3,7 +3,7 @@
 #include <fstream>
 #include <immintrin.h>
 #include <map>
-#include "Btree/btree_map.h"
+#include "../../Btree/btree_map.h"
 //---------------------------------------------------------------------------
 typedef std::pair<double,double> Coord;
 typedef std::pair<double, unsigned> segCoord;

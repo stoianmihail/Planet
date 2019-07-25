@@ -1,4 +1,4 @@
-BOOST_ROOT := ../goost
+BOOST_ROOT := ../../goost
 BOOST_INC := ${BOOST_ROOT}/include
 
 eval: SplineEvaluation.cpp
