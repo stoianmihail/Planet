@@ -23,11 +23,18 @@ using namespace std;
 //---------------------------------------------------------------------------
 typedef std::pair<double,double> Coord;
 typedef std::pair<double, unsigned> segCoord;
+typedef btree::btree_map<double, double> btree_map;
+typedef btree::btree_map<double, unsigned> btree_map_segments;
 //---------------------------------------------------------------------------
-#define COUNT_REPETITIONS 10
-#define COUNT_BUCKETS 1000000
-#define REMEZ_MODE 0
-#define TEST_MODE 2
+// modes for splines
+#define WORK_ON_SPLINE_MODE 1
+#define SSE_SPLIT_MODE 0
+#define JUST_FIT_MODE 1
+#define LOWER_BOUND_MODE 2
+#define MAP_MODE 3
+#define BTREE_MODE 4
+#define BTREE_SPLINE_MODE 5
+#define TEST_MODE_ACTIVATED 1
 //---------------------------------------------------------------------------
 const double precision = std::numeric_limits<double>::epsilon();
 const double MIN_ANGLE = 1e-16; // 10 ^ (-precisionOfDouble)
@@ -43,22 +50,103 @@ static pair<double, double> computeOverallPrecision(const std::vector<Coord>& fu
 SplineEvaluation::SplineEvaluation() {
 }
 //---------------------------------------------------------------------------
-SplineEvaluation::SplineEvaluation(const std::vector<Coord>& function, unsigned desiredSize, const unsigned mode) {
-    this->spline = preciseApproximation(function, min(desiredSize, this->limitSplineSize));
-    
-    cerr << "The spline is now working, waiting for the polynomial" << endl;
-    
-    pair<double, double> errors = computeOverallPrecision(function, this->spline);
-    cerr << "maxError = " << errors.first << " avgError = " << errors.second << endl;
-    
-    if ((mode == REMEZ_MODE) || (mode == TEST_MODE))  {
-        // get the segment spline
-        transformSpline();
+SplineEvaluation::SplineEvaluation(const std::vector<Coord>& function, unsigned desiredSize, const unsigned useSplineMode, const unsigned searchMode, const unsigned testMode) {
+    if (useSplineMode == WORK_ON_SPLINE_MODE) {
+        // Compute the spline
+        this->spline = preciseApproximation(function, min(desiredSize, this->limitSplineSize));
+        // Get the errors
+        pair<double, double> errors = computeOverallPrecision(function, this->spline);
+        cerr << "maxError = " << errors.first << " avgError = " << errors.second << endl;
+#if 0
+        cerr << "Print spline : " << endl;
+        for (auto coord: this->spline)
+            cerr << "(" << coord.first << "," << coord.second << ")" << endl;
+#endif
+        switch (searchMode) {
+            case SSE_SPLIT_MODE : {
+                cerr << "enter Split Mode" << endl;
+                // separate the spline into countOfBuckets smaller splines
+                splitSegmentSpline();
+                this->polyBuckets = new long double*[countOfBuckets];
+                
+                // fit each spline
+                for (unsigned index = 0; index < this->countOfBuckets; ++index) {
+                    globalSpline = this->splineBuckets[index];
+                    changeIntoArray(&this->polyBuckets[index], fitSpline(this->splineBuckets[index]));
+                }
+                cerr << "quit Split Mode" << endl;
+                break;
+            }
+            case JUST_FIT_MODE : {
+                cerr << "enter just fit mode" << endl;
+                // get the segment spline
+                transformSpline();
 
-        // now fit it
-        globalSpline = this->segmentSpline;
-        changeIntoArray(fitSpline(this->segmentSpline));
+                // now fit it
+                globalSpline = this->segmentSpline;
+                changeIntoArray(&this->poly, fitSpline(this->segmentSpline));
+                cerr << "quit just fit mode" << endl;
+                break;
+            }
+            case BTREE_SPLINE_MODE : {
+                cerr << "enter btree spline mode" << endl;
+                transformSpline();
+                this->btreeSegments = new btree_map_segments; 
+                for (auto coord: this->segmentSpline) {
+                    this->btreeSegments->insert(coord);
+                }
+                cerr << "done with btree spline mode" << endl;
+                break;
+            }
+        }
+        // Pad the spline with dummy values
+        convertValues();
+    } else {
+        switch (searchMode) {
+            case BTREE_MODE : {
+                cerr << "Enter values in btree" << endl;
+                this->btreeMap = new btree_map;
+                for (auto coord: function) {
+                    this->btreeMap->insert(coord);
+                }
+                cerr << "Done with btree" << endl;
+                if (testMode != TEST_MODE_ACTIVATED)
+                    break;
+            }
+            case MAP_MODE : {
+                cerr << "Enter the values into map" << endl;
+                for (auto coord: function) {
+                    this->coordinates[coord.first] = coord.second;
+                }
+                cerr << "Done with the map" << endl;
+                break;
+            }
+        }
     }
+}
+//---------------------------------------------------------------------------
+void SplineEvaluation::splitSegmentSpline() 
+// split the segment spline into 5 smaller splines
+{
+    // alloc the smaller splines
+    this->splineBuckets = new std::vector<segCoord>[countOfBuckets];
+    
+    // Get the index of the first split
+    unsigned splittedPos = this->spline.size() / countOfBuckets;
+    unsigned ptr = splittedPos, segmentCount = 0, splineSize = this->spline.size();
+    for (unsigned splineOrder = 0; splineOrder < countOfBuckets; ++splineOrder) {
+        // Construct the next smaller spline
+        for (unsigned index = ptr - splittedPos; (index < ptr) && (index < splineSize); ++index) {
+            this->splineBuckets[splineOrder].push_back(make_pair(this->spline[index].first, segmentCount++));
+        }
+        // add the next splitted position
+        if (splineOrder != this->countOfBuckets - 1)
+            this->splittedPositions[splineOrder] = this->spline[segmentCount - 1].first;
+        // go to the next spline
+        ptr += splittedPos;
+    }
+    // Load the ymm-register with the limits of the splines
+    saveLimits = _mm_loadu_pd(this->splittedPositions);
 }
 //---------------------------------------------------------------------------
 SplineEvaluation::SplineEvaluation(unsigned size, const double* x, const double* y) {
@@ -71,7 +159,7 @@ void SplineEvaluation::save(std::ofstream& file_out)
 // save in binary file the spline and the polynomial
 {
     file_out.write(reinterpret_cast<char*>(this->spline.data()),this->spline.size()*sizeof(pair<double,double>));
-    file_out.write(reinterpret_cast<char*>(this->poly),polySize * sizeof(long double));
+    file_out.write(reinterpret_cast<char*>(this->poly),(polyGrade + 1) * sizeof(long double));
 }
 //---------------------------------------------------------------------------
 void SplineEvaluation::load(std::ifstream& file_in) 
@@ -82,13 +170,13 @@ void SplineEvaluation::load(std::ifstream& file_in)
     auto size=file_in.tellg()-pos;
     file_in.seekg(0,ios::beg);
 
-    unsigned splineSize = ((size / sizeof(double)) - polySize) / 2;
+    unsigned splineSize = ((size / sizeof(double)) - (polyGrade + 1)) / 2;
     
     this->spline.resize(splineSize);
-    this->poly = new long double[polySize];
+    this->poly = new long double[polyGrade + 1];
     
     file_in.read(reinterpret_cast<char*>(this->spline.data()),splineSize * sizeof(pair<double,double>));
-    file_in.read(reinterpret_cast<char*>(this->poly),polySize*sizeof(long double));
+    file_in.read(reinterpret_cast<char*>(this->poly),(polyGrade + 1)*sizeof(long double));
     convertValues();
 }
 //---------------------------------------------------------------------------
@@ -462,15 +550,13 @@ static double defineFunction(const double& x)
     return interpolateWithSegments(globalSpline, x);
 }
 //---------------------------------------------------------------------------
-void SplineEvaluation::changeIntoArray(boost::math::tools::polynomial<long double> poly) 
+void SplineEvaluation::changeIntoArray(long double** moveHere, boost::math::tools::polynomial<long double> poly) 
 // change the STL-vectors into simple arrays. Searching on them is faster.
 {
+    *moveHere = new long double[this->polyGrade + 1];
     // Copy the polynomial
-    this->poly = new long double[poly.size()];
     for (unsigned index = 0; index < poly.size(); ++index)
-        this->poly[index] = poly[index];
-    // Copy the x-coordinates and pad with dummy values
-    convertValues();
+        (*moveHere)[index] = poly[index];
 }
 //---------------------------------------------------------------------------
 void SplineEvaluation::convertValues() 
@@ -478,12 +564,13 @@ void SplineEvaluation::convertValues()
 // this enhances the binary searches, not having the overflow condition anymore
 {
     this->length = this->spline.size();
-    
+#if 0
     // Compute offset as a power of 2 
     this->offset = 1;
     while (this->offset < this->length)
         this->offset <<= 1;
-    
+#endif
+    this->offset = 0;
     // Alloc enough memory for the inital values and 2 offsets
     this->values = new double[offset + this->length + offset];
     
@@ -504,7 +591,7 @@ boost::math::tools::polynomial<long double> SplineEvaluation::fitSpline(const st
 // use Remez algorithm to fit a polynomial to spline 
 {
     // Prepare parameters
-    unsigned sizeOfNominator = this->polySize, sizeOfDenominator = 0;
+    unsigned sizeOfNominator = this->polyGrade, sizeOfDenominator = 0;
     double a = spline.front().first, b = spline.back().first;
     bool pin = false, relError = false;
     int skew = 0, workingPrecision = boost::math::tools::digits<long double>() * 2;
@@ -519,20 +606,44 @@ double SplineEvaluation::hornerEvaluate(double& x) const
 // evaluate the polynomial with Horner's schema
 {
 #if 1
-    long double ret = this->poly[polySize];
-    for (unsigned i = polySize; i != 0; --i)
+    long double ret = this->poly[polyGrade];
+    for (unsigned i = polyGrade; i != 0; --i)
         ret = ret * x + this->poly[i - 1];
     return static_cast<double>(ret);
 #elif 1
-    // Use loop unrolling which maybe is done by the compiler. Only when polySize = 2. Otherwise, add as many instructions as you want
-    long double ret = this->poly[this->polySize];
-    ret = ret * x + this->poly[this->polySize - 1];
-    ret = ret * x + this->poly[this->polySize - 2];
+    // Use loop unrolling which maybe is done by the compiler. Only when polyGrade = 2. Otherwise, add as many instructions as you want
+    long double ret = this->poly[this->polyGrade];
+    ret = ret * x + this->poly[this->polyGrade - 1];
+    ret = ret * x + this->poly[this->polyGrade - 2];
     return static_cast<double>(ret);
 #else
     // for regression-type of spline
-    return x * this->poly[this->polySize] + this->poly[this->polySize - 1];
+    return x * this->poly[this->polyGrade] + this->poly[this->polyGrade - 1];
 #endif
+}
+//---------------------------------------------------------------------------
+double SplineEvaluation::hornerEvaluateByBuckets(unsigned bucketIndex, double& x) const 
+// evaluate x in the polynomial bucketIndex
+{
+    long double ret = this->polyBuckets[bucketIndex][polyGrade];
+    for (unsigned i = polyGrade; i != 0; --i)
+        ret = ret * x + this->polyBuckets[bucketIndex][i - 1];
+    return static_cast<double>(ret);
+}
+//---------------------------------------------------------------------------
+static const int popcount[4] = {0, 1, 1, 2};
+//---------------------------------------------------------------------------
+double SplineEvaluation::splittedHornerEvaluate(double& x) const 
+// evaluate the polynomials, depending on the spline where x lies in
+{
+    // load 2 x-values
+    __m128d constant = _mm_set1_pd(x);
+    // compare with greater than
+    constant = _mm_cmpgt_pd(constant, this->saveLimits); 
+    // Get the result of the comparison
+    int ret = _mm_movemask_pd(constant);
+    // Count how many splitter x is greater than.
+    return hornerEvaluateByBuckets(popcount[ret], x);
 }
 //---------------------------------------------------------------------------
 unsigned SplineEvaluation::binarySearch(unsigned lower, unsigned upper, double& x) const
@@ -550,50 +661,13 @@ unsigned SplineEvaluation::binarySearch(unsigned lower, unsigned upper, double& 
 unsigned SplineEvaluation::searchLeft(int index, double& x) const
 // search in the left part of the point "index" to exact place where x lies
 {
-#if 0
-    // We've already padded the left part with values lower than the first element of the array
-    // In this way we don't have any overflows
-    // Make a fast check for the first 2 values
-    if (this->values[index - 1] < x)
-        return index - 1;
-    if (this->values[index - 2] < x)
-        return index - 2;
-    
-    double powers[4];
-    int pow = 4;
-    // Load x in an ymm register
-    __m256d constant = _mm256_set1_pd(x);
-    leftAvxExpSearch : {
-        // Load the next steps
-        powers[0] = this->values[index - pow];
-        powers[1] = this->values[index - (pow << 1)];
-        powers[2] = this->values[index - (pow << 2)];
-        powers[3] = this->values[index - (pow << 3)];
-        __m256d ymm = _mm256_loadu_pd(powers);
-        
-        // Compare x with the further steps
-        ymm = _mm256_cmp_pd(constant, ymm, 0x1);
-        // Get the result of the comparison
-        int ret = _mm256_movemask_pd(ymm);
-        
-        // If x is still lower than all steps, continue searching
-        if (ret == 0xf) {
-            pow <<= 4;
-            goto leftAvxExpSearch;
-        }
-        // The last used power is shifted with the count of steps which are greater than x (the number of set bits in ret)
-        pow <<= __builtin_popcount(ret);
-    }
-    // Continue with binary search, based on the last power
-    // Don't forget that we padded the array, so use "offset" a the lowest index of the array
-    return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);
-#elif 1
+#if 1
     // We've already padded the left part with values lower than the first element of the array
     // In this way we don't have any overflows
     int pow = 1;
-    while (this->values[index - pow] > x)
+    while ((index >= pow) && (this->values[index - pow] > x))
         pow *= 2;
-    return SplineEvaluation::binarySearch(max(index - pow, this->offset), index - pow / 2, x);
+    return SplineEvaluation::binarySearch(max(index - pow, 0), index - pow / 2, x);
 #else
     // We've already padded the left part with values lower than the first element of the array
     // In this way we don't have any overflows
@@ -634,50 +708,13 @@ unsigned SplineEvaluation::searchLeft(int index, double& x) const
 unsigned SplineEvaluation::searchRight(int index, double& x) const
 // search in the right part of the point "index" to exact place where x lies
 {
-#if 0
-    // We've already padded the right part with values greater than the last element of the array
-    // In this way we don't have any overflows
-    // Make a fast check for the first 2 values
-    if (this->values[index + 1] > x)
-        return index;
-    if (this->values[index + 2] > x)
-        return index + 1;
-
-    double powers[4];
-    int pow = 4;
-    // Load x in an ymm register
-    __m256d constant = _mm256_set1_pd(x);
-    rightAvxExpSearch : {
-        // Load the next steps
-        powers[0] = this->values[index + pow];
-        powers[1] = this->values[index + (pow << 1)];
-        powers[2] = this->values[index + (pow << 2)];
-        powers[3] = this->values[index + (pow << 3)];
-        
-        // Compare x with the further steps
-        __m256d ymm = _mm256_loadu_pd(powers);
-        ymm = _mm256_cmp_pd(constant, ymm, 0xe);
-        // Get the result of the comparison
-        int ret = _mm256_movemask_pd(ymm);
-        
-        // If x is still greater than all steps, continue searching
-        if (ret == 0xf) {
-            pow <<= 4;
-            goto rightAvxExpSearch;
-        }
-        // The last used power is shifted with the count of steps which are lower than x (the number of set bits in ret)
-        pow <<= __builtin_popcount(ret);
-    }
-    // Continue with binary search, based on the last power
-    // Don't forget that we padded the array.
-    return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1 + this->offset), x);
-#elif 1
+#if 1
     // We've already padded the right part with values greater than the last element of the array
     // In this way we don't have any overflows
     int pow = 1;
-    while (this->values[index + pow] < x)
+    while ((index + pow < this->length) && (this->values[index + pow] < x))
         pow <<= 1;
-    return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1 + this->offset), x);
+    return SplineEvaluation::binarySearch(index + pow / 2, min(index + pow, this->length - 1), x);
 #else
     // We've already padded the right part with values greater than the last element of the array
     // In this way we don't have any overflows
@@ -731,7 +768,7 @@ unsigned SplineEvaluation::findExactSegment(double segment, double& x) const
 // find the segment where x lies
 {   
     // first approximate where x could lie
-    unsigned candSegment = this->offset + filterSegment(this->length - 1, segment);
+    unsigned candSegment = filterSegment(this->length - 1, segment);
     
     // find the exact segment with exponential search
     if (x < this->values[candSegment]) {
@@ -757,7 +794,7 @@ unsigned SplineEvaluation::findExactSegment(double segment, double& x) const
 double SplineEvaluation::selfInterpolate(unsigned segment, double& x) const
 // get f(x) at segment
 {
-    Coord up = this->spline[segment + 1 - this->offset], down = this->spline[segment - this->offset];
+    Coord up = this->spline[segment + 1], down = this->spline[segment];
     double dx = up.first - down.first;
     double dy = up.second - down.second;
     return down.second + (x - down.first) * (dy / dx); 
@@ -771,7 +808,33 @@ double SplineEvaluation::chebyshevEvaluate(double& x) const
         return spline.front().second;
     if (x >= spline.back().first)
         return spline.back().second;
-    return selfInterpolate(findExactSegment(hornerEvaluate(x), x), x);
+    //cerr << findExactSegment(hornerEvaluate(x), x) << endl;
+    return selfInterpolate(findExactSegment(hornerEvaluate(x), x), x); 
+}
+//---------------------------------------------------------------------------
+double SplineEvaluation::splittedChebyshevEvaluate(double& x) const 
+// evaluates f(x), after having fitted a polynomial to the spline
+{
+    // Check the boundaries
+    if (x <= spline.front().first)
+        return spline.front().second;
+    if (x >= spline.back().first)
+        return spline.back().second;
+    //cerr << findExactSegment(splittedHornerEvaluate(x), x) << endl;
+    return selfInterpolate(findExactSegment(splittedHornerEvaluate(x), x), x);  
+}
+//---------------------------------------------------------------------------
+double SplineEvaluation::btreeSegmentsEvaluate(double& x) const 
+// evaluates f(x) with btree spline
+{
+    // Check the boundaries
+    if (x <= spline.front().first)
+        return spline.front().second;
+    if (x >= spline.back().first)
+        return spline.back().second;
+    //cerr << "segment = " << (this->btreeSegments->lower_bound(x)->second) << "soll gleich " << realSegment(this->spline, x) << endl;
+    auto iter = this->btreeSegments->lower_bound(x);
+    return selfInterpolate(iter->second - 1, x);
 }
 //---------------------------------------------------------------------------
 static double interpolate(const vector<Coord>& spline, double pos)
@@ -815,10 +878,34 @@ double SplineEvaluation::evaluate(double& pos) const
 #endif
 }
 //---------------------------------------------------------------------------
+double SplineEvaluation::mapEvaluate(double& pos) const 
+// evaluate with the preprocessed map
+{
+    if (pos <= this->coordinates.begin()->first)
+        return this->coordinates.begin()->second;
+    if (pos >= (--this->coordinates.end())->first)
+        return (--this->coordinates.end())->second;
+    auto iter = this->coordinates.lower_bound(pos);
+    if (iter->first == pos)
+        return iter->second;
+    return iter->second;
+}
+//---------------------------------------------------------------------------
+double SplineEvaluation::btreeEvaluate(double& pos) const 
+// evaluate with the preprocessed map
+{
+    if (pos <= this->btreeMap->begin()->first)
+        return this->btreeMap->begin()->second;
+    if (pos >= (--this->btreeMap->end())->first)
+        return (--this->btreeMap->end())->second;
+    auto iter = this->btreeMap->lower_bound(pos);
+    return iter->second;
+}
+//---------------------------------------------------------------------------
 int main(int argc,char* argv[])
 {
-   if (argc < 5) {
-      cerr << "usage: " << argv[0] << " file samplingPoints countToRead(-1 -> all) modeOfSearch(0 -> fitting, 1 -> lower_bound, 2 -> compare)" << endl;
+   if (argc < 7) {
+      cerr << "usage: " << argv[0] << " file samplingPoints countToRead(-1 -> all) useOfSpline(0 -> without Spline, 1 -> with Spline) modeOfSearch(0 -> split & fit, 1 -> only fit, 2 -> lower_bound, 3 -> map, 4 -> btree, 5 -> btree & spline) testMode(0, 1) fileRandom" << endl;
       return 1;
    }
 #if 1
@@ -842,7 +929,7 @@ int main(int argc,char* argv[])
         in.read(reinterpret_cast<char*>(cdf.data()),elements*sizeof(pair<double,double>));
 #endif
     }
-#elif 0
+#else
     // Read from a .txt file
     unsigned countToRead = atoi(argv[3]);
     ifstream in(argv[1]);
@@ -858,186 +945,52 @@ int main(int argc,char* argv[])
     }
 #endif
     cerr << "Reading done!" << endl;
-#if 0
-    // Debugging
+
     unsigned size = atoi(argv[2]);
-    SplineEvaluation spline(cdf, size);
-    cerr << "Size of spline " << spline.size() << endl;
-    
-    double curr = 0;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (auto elem: cdf) {
-        double y = spline.evaluate(elem.first);
-        curr += fabs(y - elem.second);
-    }
-    cerr << setprecision(12) << "check: " << curr / cdf.size() << endl;
-    auto stop = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count(); 
-    double elapsedTime = duration / 1e3;
-    cerr << elapsedTime << "ms" << endl;
-#else
-    
-#if 1
-    unsigned size = atoi(argv[2]);
-    unsigned modeOfSearch = atoi(argv[4]);
+    unsigned useOfSpline = atoi(argv[4]);
+    unsigned modeOfSearch = atoi(argv[5]);
+    unsigned testMode = atoi(argv[6]);
     
     // Construct the spline and also fit the polynomial if modeSearch allows for that
-    cerr << "Begin of constructing the spline" << endl;
-    SplineEvaluation reduced(cdf, size, modeOfSearch);
-    cerr << "Spline built" << endl;
-    
-    cerr << "spline of size = " << reduced.spline.size() << endl;
-    
-#endif
-    
-#define WRITE_MODE 0
-    
-#if 0
-    ofstream out("savedspline");
-    reduced.save(out);
-#else
-    
-#if 0
-    for (Coord point: reduced.spline) {
-        cerr << setprecision(12) << "(" << point.first << " " << point.second << ")" << endl;
-    }
-    cerr << "That was the spline" << endl;
-#endif
-    
-#if 1
-    
-    if ((modeOfSearch == REMEZ_MODE) || (modeOfSearch == TEST_MODE)) {
-        cerr << "Poly : with size = " << reduced.polySize << endl;
-        for (unsigned index = 0; index <= reduced.polySize; ++index) {
-            cerr << reduced.poly[index] << endl;
-        }
-        cerr << endl;
-    }
-#if 0
-    cerr << "Evaluate with horen " << endl;
-    for (auto elem: cdf) {
-        double y = reduced.hornerEvaluate(elem.first);
-        cerr << elem.first << " --> " << y << " against " << elem.second << endl;
-    }
-#endif
-    cerr << "precision = " << precision << endl;
-#endif
-    
-#if 0
-    unsigned size = atoi(argv[2]);
-    unsigned modeOfSearch = atoi(argv[4]);
-#endif
+    SplineEvaluation reduced(cdf, size, useOfSpline, modeOfSearch, testMode);
+
     // Shuffle the indexes in order to test
     std::vector<int> testIndexes(cdf.size());
-    for (unsigned index = 0; index < cdf.size(); ++index)
-        testIndexes[index] = index;
     
-    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-    shuffle(testIndexes.begin(), testIndexes.end(), std::default_random_engine(seed));
+    if (argc == 8) {
+        ifstream randomFile(argv[7]);
+        randomFile.read(reinterpret_cast<char*>(testIndexes.data()),cdf.size()*sizeof(int));
+        randomFile.close();
+    } else {
+        for (unsigned index = 0; index < cdf.size(); ++index)
+            testIndexes[index] = index;
+        
+        // This also has an influence upon the runtime
+        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+        shuffle(testIndexes.begin(), testIndexes.end(), std::default_random_engine(seed));
+    }
 
-    auto start = std::chrono::high_resolution_clock::now();
-    switch (modeOfSearch) {
-        // Apply the fit of polynomial O(log(chebysevNorm)) - speedup of 3x
-        case REMEZ_MODE : {
-            //double sum = 0, maxDiff = 0;
-            //for (unsigned index = 0; index < COUNT_REPETITIONS; ++index) {
-#if 0
-            ifstream file_in;
-                for (unsigned index = 0; index < COUNT_REPETITIONS; ++index) {
-                    cerr << "Progerss " << index << endl;
-                    file_in.open("savedspline");
-                    reduced.load(file_in);
-                    cerr << "loaded" << endl;
-                    unsigned curr = 0;
-                    for (unsigned iter = 0; iter < COUNT_BUCKETS; ++iter) {
-                        reduced.chebyshevEvaluate(cdf[testIndexes[curr + index]].first);
-                    }
-                    curr += COUNT_BUCKETS;
-                    file_in.close();
-                }
-#else
-                double sum = 0, maxDiff = 0;
-                for (unsigned index = 0; index < cdf.size(); ++index) {
-#if 1
-                    reduced.chebyshevEvaluate(cdf[testIndexes[index]].first);
-#else
-                    // Test the deviations from the polynomial to the exact segment of each point
-                    Coord elem = cdf[testIndexes[index]];
-                    double segment = reduced.hornerEvaluate(elem.first);
-#if 1
-                    unsigned candSegment = filterSegment(reduced.spline.size() - 1, segment);
-                    
-#endif
-                    unsigned exactSeg = realSegment(reduced.spline, elem.first);
-                    
-                    //cerr << "actual segment " << candSegment << " exact : " << exactSeg << " " << abs(static_cast<double>(candSegment - exactSeg)) << endl; 
-#if 1
-                    double diff;
-                    if (candSegment > exactSeg)
-                        diff = candSegment - exactSeg;
-                    else
-                        diff = exactSeg - candSegment;
-                    
-                    //++apply;
-                    //cerr << diff << " " << maxDiff << endl;
-                    
-                    //if (apply == 50)
-                        //exit(0);
-                    
-                    sum += diff;
-                    if (diff > maxDiff)
-                        maxDiff = diff;
-#endif
-#endif
-                }
-               
-            //}
-            //auto stop = std::chrono::high_resolution_clock::now();
-            //auto duration = stop - start;
-            //cerr << "remz: took: " << duration.count() * 1e-6 / COUNT_REPETITIONS << "ms" << endl;
-    
-            // cerr << "goesLeft = " << goLeft << " and goesRight " << goRight << endl;
-    
-            cerr << "globalDiff = " << globalDiff << " mit " << globalDiff / cdf.size() << endl;
-            cerr << "Avg deviation : " << (sum / cdf.size()) << " Max deviation : " << maxDiff << endl;
-#endif
-            break;
-        }
-        // Use only lower_bound O(log(size of spline))
-        case 1 : {
-#if 1
-            cerr << cdf.size() << endl;
-            for (unsigned index = 0; index < cdf.size(); ++index) {
-                // Coord elem = cdf[testIndexes[index]];
-                //cerr << index << endl;
-                reduced.evaluate(cdf[testIndexes[index]].first);
-            }
-#else
-            ifstream file_in;
-            for (unsigned index = 0; index < COUNT_REPETITIONS; ++index) {
-                file_in.open("savedspline");
-                reduced.load(file_in);
-                cerr << "progress " << index << endl;
-                unsigned curr = 0;
-                for (unsigned iter = 0; iter < COUNT_BUCKETS; ++iter) {
-                    reduced.evaluate(cdf[testIndexes[curr + index]].first);
-                }
-                curr += COUNT_BUCKETS;
-                file_in.close();
-            }
-#endif
-            break;
-        }
-        // Debug, using both implementations
-        case TEST_MODE : {
-            cerr << "Start the direct one " << endl;
+    if (testMode == TEST_MODE_ACTIVATED) {
+        // compare only those related to spline
+        if (useOfSpline == WORK_ON_SPLINE_MODE) {
+            cerr << "Start testing with spline!" << endl;
             double curr = 0;
             unsigned alright = 0;
             for (unsigned index = 0; index < cdf.size(); ++index) {
                 Coord elem = cdf[testIndexes[index]];
-                elem.first += 0.005;
+                elem.first += 0.000;
                 //cerr << setprecision(12) << "real segment of (" << elem.first << ", " << elem.second << ") is " << realSegment(reduced.spline, elem.first) << endl;  
-                double y = reduced.chebyshevEvaluate(elem.first); //reduced.hornerEvaluate(elem.first);
+                double y;
+                if (modeOfSearch == SSE_SPLIT_MODE)
+                    y = reduced.splittedChebyshevEvaluate(elem.first);
+                else if (modeOfSearch == JUST_FIT_MODE)
+                    y = reduced.chebyshevEvaluate(elem.first);
+                else if (modeOfSearch == BTREE_SPLINE_MODE)
+                    y = reduced.btreeSegmentsEvaluate(elem.first);
+                else {
+                    cerr << "Option in test with Spline not available " << modeOfSearch << endl; 
+                    exit(0);
+                }
                 curr = max(curr, fabs(y - elem.second));
 #if 1
                 double cmp = reduced.evaluate(elem.first);
@@ -1053,18 +1006,118 @@ int main(int argc,char* argv[])
             else 
                 cerr << "mai dai o tura!!!" << endl;
             cerr << setprecision(12) << "check: " << curr / cdf.size() << endl;
-            break;
-        }
-        default : {
-            cerr << "Choose again!" << endl;
-        }
-    }
-    auto stop = std::chrono::high_resolution_clock::now();
-    auto duration = stop - start;
-    cerr << "modeOfSearch (0 -> chebyshev, 1 -> lower_bound)" << modeOfSearch << " took: " << duration.count() * 1e-6 << "ms" << endl;
-    return 0;
+        } else {
+            cerr << "Start testing without spline!" << endl;
+            double curr = 0;
+            unsigned alright = 0;
+            for (unsigned index = 0; index < cdf.size(); ++index) {
+                Coord elem = cdf[testIndexes[index]];
+                elem.first += 0.005;
+                //cerr << setprecision(12) << "real segment of (" << elem.first << ", " << elem.second << ") is " << realSegment(reduced.spline, elem.first) << endl;  
+                double y;
+                if (modeOfSearch == BTREE_MODE)
+                    y = reduced.btreeEvaluate(elem.first);
+                else {
+                    cerr << "Option in test without Spline not available " << modeOfSearch << endl; 
+                    exit(0);
+                }
+                curr = max(curr, fabs(y - elem.second));
+#if 1
+                double cmp = reduced.mapEvaluate(elem.first);
+                if (!(fabs(cmp - y) < precision)) {
+                    cerr << "Should be equal for " << setprecision(12) << fabs(cmp - y) << " " << elem.first << " --> " << setprecision(12) << y << " with " << setprecision(12)<<cmp << " against " << elem.second << endl;
+                } else {
+                    alright++;
+                }
 #endif
-
-#endif // WRITE_MODE
+            }
+            if (alright == cdf.size())
+                cerr << "parfum!!!" << endl;
+            else 
+                cerr << "mai dai o tura!!!" << endl;
+            cerr << setprecision(12) << "check: " << curr / cdf.size() << endl;
+        }
+    } else {
+        auto start = std::chrono::high_resolution_clock::now();
+        switch (modeOfSearch) {
+            // use a split through SSE comparing, then fit
+            case SSE_SPLIT_MODE : {
+                double sum = 0, maxDiff = 0;
+                for (unsigned index = 0; index < cdf.size(); ++index) {
+#if 1
+                    reduced.splittedChebyshevEvaluate(cdf[testIndexes[index]].first);
+#else
+                    // Test the deviations from the polynomial to the exact segment of each point
+                    Coord elem = cdf[testIndexes[index]];
+                    double segment = reduced.splittedHornerEvaluate(elem.first);
+                    unsigned candSegment = filterSegment(reduced.spline.size() - 1, segment);
+                    unsigned exactSeg = realSegment(reduced.spline, elem.first);
+                    
+                    double diff = (candSegment > exactSeg) ? (candSegment - exactSeg) : (exactSeg - candSegment);
+                    sum += diff;
+                    maxDiff = max(maxDiff, diff);
+#endif
+                }   
+                cerr << "globalDiff = " << globalDiff << " mit " << globalDiff / cdf.size() << endl;
+                cerr << "Avg deviation : " << (sum / cdf.size()) << " Max deviation : " << maxDiff << endl;
+                break;
+            }
+            // Apply the fit of polynomial O(log(chebysevNorm))
+            case JUST_FIT_MODE : {
+                double sum = 0, maxDiff = 0;
+                for (unsigned index = 0; index < cdf.size(); ++index) {
+#if 1
+                    reduced.chebyshevEvaluate(cdf[testIndexes[index]].first);
+#else
+                    // Test the deviations from the polynomial to the exact segment of each point
+                    Coord elem = cdf[testIndexes[index]];
+                    double segment = reduced.hornerEvaluate(elem.first);
+                    unsigned candSegment = filterSegment(reduced.spline.size() - 1, segment);
+                    unsigned exactSeg = realSegment(reduced.spline, elem.first);
+                    
+                    double diff = (candSegment > exactSeg) ? (candSegment - exactSeg) : (exactSeg - candSegment);
+                    sum += diff;
+                    maxDiff = max(maxDiff, diff);
+#endif
+                }
+                cerr << "globalDiff = " << globalDiff << " mit " << globalDiff / cdf.size() << endl;
+                cerr << "Avg deviation : " << (sum / cdf.size()) << " Max deviation : " << maxDiff << endl;
+                break;
+            }
+            // Use only lower_bound O(log(size of spline))
+            case LOWER_BOUND_MODE : {
+                cerr << cdf.size() << endl;
+                for (unsigned index = 0; index < cdf.size(); ++index) {
+                    reduced.evaluate(cdf[testIndexes[index]].first);
+                }
+                break;
+            }
+            case MAP_MODE : {
+                for (unsigned index = 0; index < cdf.size(); ++index) {
+                    reduced.mapEvaluate(cdf[testIndexes[index]].first);
+                }
+                break;
+            }
+            case BTREE_MODE : {
+                for (unsigned index = 0; index < cdf.size(); ++index) {
+                    reduced.btreeEvaluate(cdf[testIndexes[index]].first);
+                }
+                break;
+            }
+            case BTREE_SPLINE_MODE : {
+                for (unsigned index = 0; index < cdf.size(); ++index) {
+                    reduced.btreeSegmentsEvaluate(cdf[testIndexes[index]].first);
+                }
+                break;
+            }
+            default : {
+                cerr << "Choose again!" << endl;
+            }
+        }
+        auto stop = std::chrono::high_resolution_clock::now();
+        auto duration = stop - start;
+        cerr << "modeOfSearch (0 -> split & fit, 1 -> only fit, 2 -> lower_bound, 3 -> map) : " << modeOfSearch << " took: " << duration.count() * 1e-6 << "ms" << endl;
+    } // end of TEST_MODE_ACTIVATED
+    return 0;
 }
 //---------------------------------------------------------------------------
