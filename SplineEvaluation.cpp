@@ -125,6 +125,14 @@ SplineEvaluation::SplineEvaluation(const std::vector<Coord>& function, unsigned 
     }
 }
 //---------------------------------------------------------------------------
+SplineEvaluation::~SplineEvaluation() 
+// deconstructor
+{
+    // TODO: save the modes, in order to know what to free
+    // there are only 4 pointers, which have to be deleted (spl)
+    // There may be a problem with "new" on vector.
+}
+//---------------------------------------------------------------------------
 void SplineEvaluation::splitSegmentSpline() 
 // split the segment spline into 5 smaller splines
 {

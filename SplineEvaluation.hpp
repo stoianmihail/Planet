@@ -33,6 +33,8 @@ class SplineEvaluation
     static const unsigned polyGrade = 2;
     /// Constructor
     SplineEvaluation();
+    /// Deconstructor
+    ~SplineEvaluation();
     /// Constructor with the function
     SplineEvaluation(const std::vector<Coord>& function, unsigned desiredSize, const unsigned useSplineMode, const unsigned searchMode, const unsigned testMode);
     /// Constructor with given data
